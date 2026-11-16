@@ -5,7 +5,9 @@ markdown-render-speed-02 competition. It was developed against marked
 18.1.3 as the reference renderer: the task requires byte-identical HTML
 output, so the block and inline grammar patterns in `parse.js` were
 generated from marked's published grammar, and the rendering semantics
-were verified case by case against marked's output on the practice set.
+were verified case by case against marked's output on the practice set,
+the CommonMark spec examples, and differential fuzzing (mutated and
+composed documents, including large multi-paragraph documents).
 
 marked is copyright (c) 2011-2024, Christopher Jeffrey and contributors,
 and is distributed under the MIT License (see LICENSE for this entry's

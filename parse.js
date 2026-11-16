@@ -55,14 +55,22 @@ function normLabel(s) {
   return s.trim().replace(/\s+/g, " ").toLowerCase().toUpperCase().toLowerCase();
 }
 
-// Split a table row into cells, honouring escaped pipes.
+// Split a table row into cells, honouring escaped pipes. One forward
+// pass: a pipe splits only when the backslash run before it is even, which
+// the old replace-then-split-on-" |" did by scanning backwards per pipe.
 function splitCells(row, count) {
-  const t = row.replace(/\|/g, (ch, off, str) => {
-    let escaped = false;
-    for (let p = off - 1; p >= 0 && str[p] === "\\"; p--) escaped = !escaped;
-    return escaped ? "|" : " |";
-  });
-  let cells = t.split(/ \|/);
+  const cuts = [];
+  let esc = false;
+  for (let i = 0; i < row.length; i++) {
+    const ch = row[i];
+    if (esc) { esc = false; continue; }
+    if (ch === "\\") { esc = true; continue; }
+    if (ch === "|") cuts.push(i);
+  }
+  const cells = [];
+  let from = 0;
+  for (const cut of cuts) { cells.push(row.slice(from, cut)); from = cut + 1; }
+  cells.push(row.slice(from));
   if (cells.length > 0 && !cells[0].trim()) cells.shift();
   if (cells.length > 0 && !cells[cells.length - 1].trim()) cells.pop();
   if (count !== undefined) {
@@ -208,11 +216,11 @@ const CODE_REMOVE_INDENT = /^(?: {0,3}\t| {1,4})/gm;
 const INDENT_CODE_COMP = /^(\s+)(?:```)/;
 const BEGIN_SPACE = /^\s+/;
 const NON_SPACE = /[^ ]/;
+const NON_SPACE_TAB = /[^ \t]/;
 const NEWLINE_G = /\n/g;
 const LEADING_SPACE_TAB = /^[ \t]+/;
 const TAB_G = /\t/g;
 const BLANK_LINE = /^[ \t]*$/;
-const DOUBLE_BLANK = /\n[ \t]*\n[ \t]*$/;
 const BLOCKQUOTE_START = /^ {0,3}>/;
 const BQ_MARKER_WS = /^( {0,3}>)([ \t]+)/gm;
 const BQ_SETEXT = /\n {0,3}((?:=+|-+)[ \t]*)(?=\n|$)/g;
@@ -265,12 +273,81 @@ function execAt(re, str, pos) {
   return re.exec(str);
 }
 
+// Is marker (a char code) at str[pos..pos+3], preceded only by spaces?
+// The block rules that begin ` {0,3}<marker>` need exactly this, so a
+// missing marker skips the whole giant regex instead of failing it.
+function markerAhead(str, pos, code) {
+  let i = pos;
+  for (let k = 0; k < 3; k++) {
+    const c = str.charCodeAt(i);
+    if (c === code) return true;
+    if (c !== 32) return false;
+    i++;
+  }
+  return str.charCodeAt(i) === code;
+}
+
+// Can the line after pos be a table delimiter (its first non-space char,
+// within 3 spaces, is |, : or -)? Necessary for TABLE to match at pos.
+function tableDelimAhead(str, pos) {
+  const nl = str.indexOf("\n", pos);
+  if (nl === -1) return false;
+  let j = nl + 1;
+  for (let k = 0; k < 3; k++) {
+    const c = str.charCodeAt(j);
+    if (c === 124 || c === 58 || c === 45) return true;
+    if (c !== 32) return false;
+    j++;
+  }
+  const c = str.charCodeAt(j);
+  return c === 124 || c === 58 || c === 45;
+}
+
+// Is there a setext underline line (=== or ---, up to 3 leading spaces)
+// before the next blank line? Necessary for SETEXT to match at pos.
+function setextUnderlineAhead(str, pos) {
+  let i = str.indexOf("\n", pos);
+  while (i !== -1) {
+    const j = i + 1;
+    let k = j;
+    while (str[k] === " " || str[k] === "\t") k++;
+    if (k >= str.length || str[k] === "\n") return false;
+    if (k - j <= 3 && (str[k] === "=" || str[k] === "-")) {
+      let m = k;
+      while (str[m] === "=" || str[m] === "-" || str[m] === " " || str[m] === "\t") m++;
+      if (m >= str.length || str[m] === "\n") return true;
+    }
+    i = str.indexOf("\n", i + 1);
+  }
+  return false;
+}
+
+// /\n[ \t]*\n[ \t]*$/ without the regex: does s end with a blank line?
+function endsWithBlankLine(s) {
+  let i = s.length;
+  while (i > 0 && (s[i - 1] === " " || s[i - 1] === "\t")) i--;
+  if (i < 2 || s[i - 1] !== "\n") return false;
+  let j = i - 1;
+  while (j > 0 && (s[j - 1] === " " || s[j - 1] === "\t")) j--;
+  return j > 0 && s[j - 1] === "\n";
+}
+
+// /\n.*\n/ without the regex: does s hold two newlines?
+function hasTwoNewlines(s) {
+  const a = s.indexOf("\n");
+  return a !== -1 && s.indexOf("\n", a + 1) !== -1;
+}
+
 const EM_L_Y = new RegExp(EM_L.source, "yu");
 const DEL_L_Y = new RegExp(INLINE_DEL_L.source, "yu");
 const LINK_TEST = new RegExp("^" + INLINE_LINK.source);
 const SETEXT_TEST = new RegExp("^" + SETEXT.source);
 
-function blockParse(str, top, cx, inBq, out) {
+// `top` lives on cx (see parse): a paragraph is only a paragraph while
+// cx.top is true. A nested list or blockquote parse flips it as the
+// reference's Lexer state does, so a paragraph after a nested list inside
+// a list item is a paragraph, not bare text.
+function blockParse(str, cx, inBq, out) {
   const nodes = out || [];
   let pos = 0;
   const end = str.length;
@@ -318,7 +395,7 @@ function blockParse(str, top, cx, inBq, out) {
       continue;
     }
     let bq;
-    if ((bq = parseBlockquote(str, pos, cx))) {
+    if (markerAhead(str, pos, 62) && (bq = parseBlockquote(str, pos, cx))) {
       nodes.push(bq.node);
       pos = bq.next;
       continue;
@@ -329,13 +406,13 @@ function blockParse(str, top, cx, inBq, out) {
       pos = li.next;
       continue;
     }
-    if ((m = execAt(HTML_BLOCK, str, pos))) {
+    if (markerAhead(str, pos, 60) && (m = execAt(HTML_BLOCK, str, pos))) {
       const raw = stripTrailingBlanks(m[0]);
       nodes.push({ k: "html", text: raw, pre: m[1] === "pre" || m[1] === "script" || m[1] === "style" });
       pos += raw.length;
       continue;
     }
-    if ((m = execAt(LINK_DEF, str, pos))) {
+    if (markerAhead(str, pos, 91) && (m = execAt(LINK_DEF, str, pos))) {
       if (START_ANGLE.test(m[2]) || findParenClose(m[2], "()") === -1) {
         const raw = stripTrailing(m[0], "\n");
         const prev = nodes[nodes.length - 1];
@@ -356,18 +433,18 @@ function blockParse(str, top, cx, inBq, out) {
       }
     }
     let tb;
-    if ((tb = parseTable(str, pos, cx))) {
+    if (tableDelimAhead(str, pos) && (tb = parseTable(str, pos, cx))) {
       nodes.push(tb.node);
       pos = tb.next;
       continue;
     }
-    if ((m = execAt(SETEXT, str, pos))) {
+    if (setextUnderlineAhead(str, pos) && (m = execAt(SETEXT, str, pos))) {
       const raw = stripTrailing(m[0], "\n");
       nodes.push({ k: "heading", depth: m[2].charAt(0) === "=" ? 1 : 2, text: m[1].trim() });
       pos += raw.length;
       continue;
     }
-    if (top && (m = execAt(PARAGRAPH, str, pos))) {
+    if (cx.top && (m = execAt(PARAGRAPH, str, pos))) {
       let text = m[1];
       if (text.charCodeAt(text.length - 1) === 10) text = text.slice(0, -1);
       const prev = nodes[nodes.length - 1];
@@ -386,6 +463,7 @@ function blockParse(str, top, cx, inBq, out) {
     }
     throw new Error("Infinite loop on byte: " + str.charCodeAt(pos));
   }
+  cx.top = true;
   return nodes;
 }
 
@@ -431,7 +509,10 @@ function parseBlockquote(str, pos, cx) {
       .replace(BQ_SETEXT2, "");
     s = s ? s + "\n" + h : h;
     r = r ? r + "\n" + u : u;
-    blockParse(u, true, cx, true, items);
+    const savedTop = cx.top;
+    cx.top = true;
+    blockParse(u, cx, true, items);
+    cx.top = savedTop;
     if (lines.length === 0) break;
     const k = items[items.length - 1];
     if (k && (k.k === "code" || k.k === "heading" || k.k === "hr" || k.k === "html" || k.k === "table")) break;
@@ -481,15 +562,17 @@ function parseList(str, pos, cx) {
   let p = false;
   while (e) {
     let u = false;
-    let d = "";
+    const dParts = [];
     const t = execAt(itemRe, e, 0);
     if (!t || execAt(HR, e, 0)) break;
     const k = consumed();
     e = e.substring(t[0].length);
-    const g = t[2].split("\n", 1)[0];
+    const gNl = t[2].indexOf("\n");
+    const g = gNl === -1 ? t[2] : t[2].slice(0, gNl);
     const b = t[1].length;
     let mLine = g.replace(LEADING_SPACE_TAB, (v) => expandTabs(v, b));
-    let f = e.split("\n", 1)[0];
+    const fNl0 = e.indexOf("\n");
+    let f = fNl0 === -1 ? e : e.slice(0, fNl0);
     const y0 = !mLine.trim();
     let R = 0;
     if (y0) {
@@ -497,7 +580,7 @@ function parseList(str, pos, cx) {
     } else {
       R = mLine.search(NON_SPACE);
       R = R > 4 ? 1 : R;
-      d = mLine.slice(R);
+      dParts.push(mLine.slice(R));
       R += b;
     }
     let y = y0;
@@ -513,29 +596,45 @@ function parseList(str, pos, cx) {
       const M = HTML_BEGIN_RE(R);
       const ne = BLOCKQUOTE_BEGIN_RE(R);
       while (e) {
-        const U = e.split("\n", 1)[0];
+        const nl = e.indexOf("\n");
+        const U = nl === -1 ? e : e.slice(0, nl);
         f = U;
         const Z = f.replace(LEADING_SPACE_TAB, (me) => expandTabs(me));
-        if (ee.test(f) || te.test(f) || M.test(f) || ne.test(f) || v.test(f) || Q.test(f)) break;
-        if (Z.search(NON_SPACE) >= R || !f.trim()) {
-          d += "\n" + Z.slice(R);
+        // The six tests below all need the line's first non-space char to
+        // be one of > # ` ~ < * + - _ or a digit; anything else fails all
+        // of them, so skip the regexes outright.
+        const zi = Z.search(NON_SPACE);
+        const fc = zi === -1 ? "" : Z[zi];
+        if (fc !== "" && "><#`~*+-_0123456789".indexOf(fc) !== -1 &&
+            (ee.test(f) || te.test(f) || M.test(f) || ne.test(f) || v.test(f) || Q.test(f))) break;
+        const blankLine = !f.trim();
+        if (zi >= R || blankLine) {
+          dParts.push(Z.slice(R));
         } else {
-          if (y || mLine.replace(TAB_G, "    ").search(NON_SPACE) >= 4 || ee.test(mLine) || te.test(mLine) || M.test(mLine) || Q.test(mLine)) break;
+          // Same guard for the four tests on the previous line's content
+          // (fences, heading, html, hr only here).
+          const mExp = mLine.includes("\t") ? mLine.replace(TAB_G, "    ") : mLine;
+          const mi = mLine.search(NON_SPACE_TAB);
+          const mc = mi === -1 ? "" : mLine[mi];
+          if (y || mExp.search(NON_SPACE) >= 4 ||
+              (mc !== "" && "`~#<-_*".indexOf(mc) !== -1 &&
+               (ee.test(mLine) || te.test(mLine) || M.test(mLine) || Q.test(mLine)))) break;
           let qe = f;
           if (/^ {0,3}(?:=+|-+) *$/.test(f) && SETEXT_TEST.test(mLine + "\n" + f)) {
             qe = "    " + Z.replace(/^ {0,3}/, "");
           }
-          d += "\n" + qe;
+          dParts.push(qe);
         }
-        y = !f.trim();
-        e = e.substring(U.length + 1);
+        y = blankLine;
+        e = nl === -1 ? "" : e.slice(nl + 1);
         mLine = Z.slice(R);
       }
     }
+    const d = (y0 && dParts.length > 0 ? "\n" : "") + dParts.join("\n");
     const A = n.slice(k, consumed());
     if (!listNode.loose) {
       if (p) listNode.loose = true;
-      else if (DOUBLE_BLANK.test(A)) p = true;
+      if (endsWithBlankLine(A)) p = true;
     }
     listNode.items.push({ raw: A, task: LIST_TASK.test(d), loose: false, text: d, tokens: [] });
   }
@@ -545,10 +644,11 @@ function parseList(str, pos, cx) {
   h.text = h.text.trimEnd();
   listNode.raw = n.slice(0, consumed()).trimEnd();
   for (const item of listNode.items) {
-    item.tokens = blockParse(item.text, false, cx, false);
+    cx.top = false;
+    item.tokens = blockParse(item.text, cx, false);
     if (!listNode.loose) {
       const spaces = item.tokens.filter((t) => t.k === "space");
-      if (spaces.length > 0 && spaces.some((g) => ANY_LINE.test(g.raw))) listNode.loose = true;
+      if (spaces.length > 0 && spaces.some((g) => hasTwoNewlines(g.raw))) listNode.loose = true;
     }
   }
   for (const item of listNode.items) {
@@ -739,22 +839,21 @@ function buildMask(str, cx) {
 
 // Last possible closer indices in the masked string: for "*" and "_"
 // the last index whose preceding char is not space/tab/newline/CR/FF
-// (i.e. the closer can close); for "~" the same. (fe in marked.)
+// (i.e. the closer can close); for "~" the same. (fe in marked.) Scanned
+// backwards: the first run start found for a delimiter is its last one,
+// and the scan stops once all three are found.
 function scanClosers(s) {
   const em = { "*": -1, _: -1 };
   let del = -1;
-  const n = s.length;
-  for (let i = 0; i < n; i++) {
+  for (let i = s.length - 1; i >= 0; i--) {
     const r = s[i];
     if (r !== "*" && r !== "_" && r !== "~") continue;
+    if (i > 0 && s[i - 1] === r) continue; // not the run's start
     const o = i === 0 ? "\n" : s[i - 1];
-    let j = i + 1;
-    for (; j < n && s[j] === r;) j++;
-    if (o !== " " && o !== "\t" && o !== "\n" && o !== "\r" && o !== "\f") {
-      if (r === "~") del = i;
-      else em[r] = i;
-    }
-    i = j - 1;
+    if (o === " " || o === "\t" || o === "\n" || o === "\r" || o === "\f") continue;
+    if (r === "~") { if (del === -1) del = i; }
+    else if (em[r] === -1) em[r] = i;
+    if (del !== -1 && em["*"] !== -1 && em["_"] !== -1) break;
   }
   return { em, del };
 }
@@ -767,13 +866,17 @@ function tryEmStrong(str, i, masked, closers, prevChar, cx, st) {
   if (!m || (!m[1] && !m[2] && !m[3] && !m[4])) return null;
   const delim = m[0][0];
   const o = prevChar === delim;
+  // The run-back and the char before the run come from the MASKED string,
+  // as in the reference: when the opener sits inside a masked span (a
+  // link, code span or tag), the masked char is an ordinary `a`, not the
+  // original char — that decides the R/mod-3 rule below.
   let l = i;
-  while (l > 0 && str[l - 1] === delim) l--;
+  while (l > 0 && masked[l - 1] === delim) l--;
   // Char before the delimiter run, as a full code point.
   let p = "";
   if (l > 0) {
-    const c = str[l - 1];
-    p = (c >= "\uDC00" && c <= "\uDFFF" && l >= 2) ? str.slice(l - 2, l) : c;
+    const c = masked[l - 1];
+    p = (c >= "\uDC00" && c <= "\uDFFF" && l >= 2) ? masked.slice(l - 2, l) : c;
   }
   const h = p === "*" || p === "_" || PUNCT_OR_SPACE.test(p);
   let n = prevChar;
@@ -827,7 +930,10 @@ function tryEmStrong(str, i, masked, closers, prevChar, cx, st) {
 function tryDel(str, i, masked, lastDel, prevChar, cx, st) {
   const m = execAt(DEL_L_Y, str, i);
   if (!m) return null;
-  if (!((m[1] || "") || !prevChar || PUNCT_OR_SPACE.test(prevChar))) return null;
+  // marked's gate: an opener followed by punctuation can only open when
+  // the char before it is absent or punctuation/space; an opener followed
+  // by an ordinary char always opens (so `a~~b~~c` dels, `a~~.b~~c` does not).
+  if ((m[1] || "") && prevChar && !PUNCT_OR_SPACE.test(prevChar)) return null;
   let o = m[0].length - 1;
   const _lc2 = m[0].charCodeAt(m[0].length - 1);
   if (_lc2 >= 0xDC00 && _lc2 <= 0xDFFF) o--;
@@ -987,12 +1093,25 @@ function inlineInner(str, cx, st) {
   }
 }
 
+// Plain-text fast path: no inline markup can occur in str, so the whole
+// string is one text run. The stop points of the text rule are a backslash,
+// <, [, *, _, `, ~, a two-space hard break, an @ (email), www., http(s),
+// ftp://, mailto: or xmpp: — ! alone only splits a run, never its output.
+const PLAIN_INLINE = /[\\<[*_`~]| {2,}\n|@|www\.|mailto:|xmpp:|ftp:\/\/|https?/i;
+
 function inlineScan(str, cx, st) {
+  if (!PLAIN_INLINE.test(str)) {
+    if (st.inRawBlock) return str;
+    return st.textMode ? decodeRefs(str) : escHtml(decodeRefs(str));
+  }
   let masked = str;
   let closerEm = null;
   let closerDel = -1;
   if (str.includes("*") || str.includes("_") || str.includes("~")) {
-    masked = buildMask(str, cx);
+    // The mask only changes the string when it holds [, `, < or \ (code
+    // spans, links, tags, backslash punctuation); without those it is str.
+    masked = (str.includes("[") || str.includes("`") || str.includes("<") || str.includes("\\"))
+      ? buildMask(str, cx) : str;
     const sc = scanClosers(masked);
     closerEm = sc.em;
     closerDel = sc.del;
@@ -1097,10 +1216,14 @@ function inlineScan(str, cx, st) {
   return out;
 }
 
-// Top-level inline render of one string. The state (inLink, inRawBlock,
+// Top-level inline render of one string. The state (inLink,
 // linkEmitted) is the document-level Lexer state: it persists across
-// paragraphs, so an unclosed <a> or <pre> tag affects later paragraphs.
+// paragraphs, so an unclosed <a> tag affects later paragraphs. But
+// inRawBlock is reset before every render, as in the reference: an
+// unclosed <code>/<kbd> tag only makes its own paragraph raw, and a
+// later paragraph is escaped and decoded normally again.
 function inlineToHtml(str, cx) {
+  cx.st.inRawBlock = false;
   return inlineInner(str, cx, cx.st);
 }
 
@@ -1116,10 +1239,11 @@ function plainText(str, cx) {
 // marked 18.1.3's marked.parse does with default options.
 // ============================================================
 export function parse(markdown) {
-  const src = String(markdown).replace(/\r\n|\r/g, "\n");
-  const cx = { links: new Map(), st: freshState() };
+  const raw = String(markdown);
+  const src = raw.indexOf("\r") === -1 ? raw : raw.replace(/\r\n|\r/g, "\n");
+  const cx = { links: new Map(), st: freshState(), top: true };
   const nodes = [];
-  blockParse(src, true, cx, false, nodes);
+  blockParse(src, cx, false, nodes);
   const out = [];
   renderNodes(nodes, cx, out);
   return out.join("");

@@ -4,6 +4,9 @@
 // from parse.js, and writes /output/html.json: a JSON array of the HTML
 // strings, one per case and in the cases' order. Outside a container
 // MAKEFUN_INPUT_DIR and MAKEFUN_OUTPUT_DIR stand in for /input and /output.
+// Rendering is deterministic: parse is a pure function of its input (no
+// clock, randomness or I/O), so two runs over the same cases produce
+// byte-identical output.
 
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
